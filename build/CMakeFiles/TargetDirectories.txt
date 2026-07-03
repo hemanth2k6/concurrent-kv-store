@@ -1,0 +1,3 @@
+/home/hemanth/my-projects/kvstore/build/CMakeFiles/kvstore.dir
+/home/hemanth/my-projects/kvstore/build/CMakeFiles/edit_cache.dir
+/home/hemanth/my-projects/kvstore/build/CMakeFiles/rebuild_cache.dir
