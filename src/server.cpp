@@ -1,74 +1,107 @@
-#include "server.h"
-#include "parser.h"
+
+#include "redis_lite/server.hpp"
+#include "redis_lite/connection.hpp"
+#include "redis_lite/logger.hpp"
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
-#include <thread>
-#include <iostream>
+#include <cstring>
+#include <csignal>
 
-Server::Server(int port, KVStore &store) : store_(store)
+std::atomic<bool> *Server::instance_running_ = nullptr;
+
+Server::Server(const Config &config)
+    : config_(config),
+      wal_(config.wal_file),
+      pool_(config.thread_pool_size)
 {
-    server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
 
+    wal_.replayInto(store_);
+}
+
+void Server::signalHandler(int /*sig*/)
+{
+    if (instance_running_)
+        instance_running_->store(false);
+}
+
+void Server::setupSignalHandlers()
+{
+    instance_running_ = &running_;
+    struct sigaction sa{};
+    sa.sa_handler = &Server::signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
+}
+
+void Server::run()
+{
+    setupSignalHandlers();
+
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ == -1)
+    {
+        LOG_ERROR("socket() failed: " + std::string(strerror(errno)));
+        return;
+    }
     int opt = 1;
-    setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    address_.sin_family = AF_INET;
-    address_.sin_addr.s_addr = INADDR_ANY;
-    address_.sin_port = htons(port);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(config_.port);
 
-    bind(server_fd_, (struct sockaddr *)&address_, sizeof(address_));
-}
-
-void Server::start()
-{
-    listen(server_fd_, 10);
-    std::cout << "Redis-compatible Server listening on port 6379...\n";
-
-    while (true)
+    if (bind(listen_fd_, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        int addrlen = sizeof(address_);
-        int client_socket = accept(server_fd_, (struct sockaddr *)&address_, (socklen_t *)&addrlen);
-
-        std::thread(&Server::handle_client, this, client_socket).detach();
+        LOG_ERROR("bind() failed: " + std::string(strerror(errno)));
+        close(listen_fd_);
+        return;
     }
-}
-
-void Server::handle_client(int client_socket)
-{
-    char buffer[1024] = {0};
-
-    while (true)
+    if (listen(listen_fd_, SOMAXCONN) < 0)
     {
-        int valread = read(client_socket, buffer, 1024);
-        if (valread <= 0)
+        LOG_ERROR("listen() failed: " + std::string(strerror(errno)));
+        close(listen_fd_);
+        return;
+    }
+
+    LOG_INFO("Server listening on port " + std::to_string(config_.port));
+
+    while (running_)
+    {
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd_, (sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            if (!running_)
+                break;
+            LOG_ERROR("accept() failed: " + std::string(strerror(errno)));
             break;
-
-        std::vector<std::string> args = Parser::parse_resp(std::string(buffer, valread));
-        if (args.empty())
-            continue;
-
-        std::string command = args[0];
-        for (auto &c : command)
-            c = toupper(c);
-
-        std::string response;
-
-        if (command == "SET" && args.size() >= 3)
-        {
-            store_.set(args[1], args[2]);
-            response = Parser::format_resp_simple("OK");
         }
-        else if (command == "GET" && args.size() >= 2)
-        {
-            std::string val = store_.get(args[1]);
-            response = Parser::format_resp_bulk(val);
-        }
-        else
-        {
-            response = "-ERR unknown command\r\n";
-        }
+        LOG_INFO("New connection from " + std::string(inet_ntoa(client_addr.sin_addr)));
 
-        send(client_socket, response.c_str(), response.length(), 0);
+        // Capture by copy; Connection will own the fd
+        pool_.enqueue([this, client_fd]
+                      {
+            Connection conn(client_fd, store_, wal_);
+            conn.run();
+            close(client_fd); });
     }
-    close(client_socket);
+
+    LOG_INFO("Shutting down...");
+    pool_.shutdown();
+    if (listen_fd_ != -1)
+        close(listen_fd_);
+}
+
+void Server::shutdown()
+{
+    running_ = false;
 }

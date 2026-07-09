@@ -1,0 +1,12 @@
+# Build output
+/build/
+
+# WAL (database) logs – these are runtime data, not source
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
